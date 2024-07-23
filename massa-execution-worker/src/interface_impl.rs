@@ -226,6 +226,29 @@ impl Interface for InterfaceImpl {
         Ok(())
     }
 
+    fn increment_recursion_counter(&self) -> Result<()> {
+        let mut context = context_guard!(self);
+
+        context.recursion_counter += 1;
+
+        if context.recursion_counter > self.config.max_recursive_calls_depth {
+            bail!("recursion depth limit reached");
+        }
+
+        Ok(())
+    }
+
+    fn decrement_recursion_counter(&self) -> Result<()> {
+        let mut context = context_guard!(self);
+
+        match context.recursion_counter.checked_sub(1) {
+            Some(value) => context.recursion_counter = value,
+            None => bail!("recursion counter underflow"),
+        }
+
+        Ok(())
+    }
+
     /// Initialize the call when bytecode calls a function from another bytecode
     /// This function transfers the coins passed as parameter,
     /// prepares the current execution context by pushing a new element on the top of the call stack,
@@ -282,6 +305,8 @@ impl Interface for InterfaceImpl {
             operation_datastore: None,
         });
 
+        context.recursion_counter += 1;
+
         // return the target bytecode
         Ok(bytecode.0)
     }
@@ -294,6 +319,8 @@ impl Interface for InterfaceImpl {
         if context.stack.pop().is_none() {
             bail!("call stack out of bounds")
         }
+
+        context.recursion_counter -= 1;
 
         Ok(())
     }
@@ -1391,6 +1418,8 @@ impl Interface for InterfaceImpl {
             owned_addresses: vec![to_address],
             operation_datastore: None,
         });
+
+        context.recursion_counter += 1;
 
         // return the target bytecode
         Ok(bytecode.0)
