@@ -1104,6 +1104,7 @@ impl ExecutionState {
         &self,
         message: AsyncMessage,
         bytecode: Option<Bytecode>,
+        execution_version: u32,
     ) -> Result<AsyncMessageExecutionResult, ExecutionError> {
         let mut result = AsyncMessageExecutionResult::new();
         #[cfg(feature = "execution-info")]
@@ -1123,7 +1124,10 @@ impl ExecutionState {
             context.stack = vec![
                 ExecutionStackElement {
                     address: message.sender,
-                    coins: Default::default(),
+                    coins: match execution_version {
+                        0 => message.coins,
+                        _ => Default::default(),
+                    },
                     owned_addresses: vec![message.sender],
                     operation_datastore: None,
                 },
@@ -1175,17 +1179,27 @@ impl ExecutionState {
 
         // load and execute the compiled module
         // IMPORTANT: do not keep a lock here as `run_function` uses the `get_module` interface
-        let Ok(module) = self
-            .module_cache
-            .write()
-            .load_module(&bytecode, message.max_gas)
-        else {
-            let err =
-                ExecutionError::RuntimeError("could not load module for async execution".into());
-            let mut context = context_guard!(self);
-            context.reset_to_snapshot(context_snapshot, err.clone());
-            context.cancel_async_message(&message);
-            return Err(err);
+        let module = match context_guard!(self).execution_component_version {
+            0 => self
+                .module_cache
+                .write()
+                .load_module(&bytecode, message.max_gas)?,
+            _ => {
+                let Ok(_module) = self
+                    .module_cache
+                    .write()
+                    .load_module(&bytecode, message.max_gas)
+                else {
+                    let err = ExecutionError::RuntimeError(
+                        "could not load module for async execution".into(),
+                    );
+                    let mut context = context_guard!(self);
+                    context.reset_to_snapshot(context_snapshot, err.clone());
+                    context.cancel_async_message(&message);
+                    return Err(err);
+                };
+                _module
+            }
         };
 
         let response = massa_sc_runtime::run_function(
@@ -1269,37 +1283,76 @@ impl ExecutionState {
             self.mip_store.clone(),
         );
 
-        // Get asynchronous messages to execute
-        let messages = execution_context.take_async_batch(
-            self.config.max_async_gas,
-            self.config.async_msg_cst_gas_cost,
-        );
+        let execution_version = execution_context.execution_component_version;
+        match execution_version {
+            0 => {
+                // Get asynchronous messages to execute
+                let messages = execution_context.take_async_batch_v0(
+                    self.config.max_async_gas,
+                    self.config.async_msg_cst_gas_cost,
+                );
 
-        // Apply the created execution context for slot execution
-        *context_guard!(self) = execution_context;
+                // Apply the created execution context for slot execution
+                *context_guard!(self) = execution_context;
 
-        // Try executing asynchronous messages.
-        // Effects are cancelled on failure and the sender is reimbursed.
-        for (_message_id, message) in messages {
-            let opt_bytecode = context_guard!(self).get_bytecode(&message.destination);
-
-            match self.execute_async_message(message, opt_bytecode) {
-                Ok(_message_return) => {
-                    cfg_if::cfg_if! {
-                        if #[cfg(feature = "execution-trace")] {
-                            // Safe to unwrap
-                            slot_trace.asc_call_stacks.push(_message_return.traces.unwrap().0);
-                        } else if #[cfg(feature = "execution-info")] {
-                            slot_trace.asc_call_stacks.push(_message_return.traces.clone().unwrap().0);
-                            exec_info.async_messages.push(Ok(_message_return));
+                // Try executing asynchronous messages.
+                // Effects are cancelled on failure and the sender is reimbursed.
+                for (opt_bytecode, message) in messages {
+                    match self.execute_async_message(message, opt_bytecode, execution_version) {
+                        Ok(_message_return) => {
+                            cfg_if::cfg_if! {
+                                if #[cfg(feature = "execution-trace")] {
+                                    // Safe to unwrap
+                                    slot_trace.asc_call_stacks.push(_message_return.traces.unwrap().0);
+                                } else if #[cfg(feature = "execution-info")] {
+                                    slot_trace.asc_call_stacks.push(_message_return.traces.clone().unwrap().0);
+                                    exec_info.async_messages.push(Ok(_message_return));
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            let msg = format!("failed executing async message: {}", err);
+                            #[cfg(feature = "execution-info")]
+                            exec_info.async_messages.push(Err(msg.clone()));
+                            debug!(msg);
                         }
                     }
                 }
-                Err(err) => {
-                    let msg = format!("failed executing async message: {}", err);
-                    #[cfg(feature = "execution-info")]
-                    exec_info.async_messages.push(Err(msg.clone()));
-                    debug!(msg);
+            }
+            _ => {
+                // Get asynchronous messages to execute
+                let messages = execution_context.take_async_batch_v1(
+                    self.config.max_async_gas,
+                    self.config.async_msg_cst_gas_cost,
+                );
+
+                // Apply the created execution context for slot execution
+                *context_guard!(self) = execution_context;
+
+                // Try executing asynchronous messages.
+                // Effects are cancelled on failure and the sender is reimbursed.
+                for (_message_id, message) in messages {
+                    let opt_bytecode = context_guard!(self).get_bytecode(&message.destination);
+
+                    match self.execute_async_message(message, opt_bytecode, execution_version) {
+                        Ok(_message_return) => {
+                            cfg_if::cfg_if! {
+                                if #[cfg(feature = "execution-trace")] {
+                                    // Safe to unwrap
+                                    slot_trace.asc_call_stacks.push(_message_return.traces.unwrap().0);
+                                } else if #[cfg(feature = "execution-info")] {
+                                    slot_trace.asc_call_stacks.push(_message_return.traces.clone().unwrap().0);
+                                    exec_info.async_messages.push(Ok(_message_return));
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            let msg = format!("failed executing async message: {}", err);
+                            #[cfg(feature = "execution-info")]
+                            exec_info.async_messages.push(Err(msg.clone()));
+                            debug!(msg);
+                        }
+                    }
                 }
             }
         }

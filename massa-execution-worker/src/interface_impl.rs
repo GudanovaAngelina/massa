@@ -226,6 +226,11 @@ impl Interface for InterfaceImpl {
         Ok(())
     }
 
+    fn get_interface_version(&self) -> Result<u32> {
+        let context = context_guard!(self);
+        Ok(context.execution_component_version)
+    }
+
     /// Initialize the call when bytecode calls a function from another bytecode
     /// This function transfers the coins passed as parameter,
     /// prepares the current execution context by pushing a new element on the top of the call stack,
@@ -1184,10 +1189,6 @@ impl Interface for InterfaceImpl {
             bail!("validity end thread exceeds the configuration thread count")
         }
 
-        if max_gas < self.config.gas_costs.max_instance_cost {
-            bail!("max gas is lower than the minimum instance cost")
-        }
-
         let target_addr = Address::from_str(target_address)?;
 
         // check that the target address is an SC address
@@ -1206,12 +1207,19 @@ impl Interface for InterfaceImpl {
         let mut execution_context = context_guard!(self);
         let emission_slot = execution_context.slot;
 
-        if Slot::new(validity_end.0, validity_end.1) < Slot::new(validity_start.0, validity_start.1)
-        {
-            bail!("validity end is earlier than the validity start")
-        }
-        if Slot::new(validity_end.0, validity_end.1) < emission_slot {
-            bail!("validity end is earlier than the current slot")
+        let execution_component_version = execution_context.execution_component_version;
+        if execution_component_version > 0 {
+            if max_gas < self.config.gas_costs.max_instance_cost {
+                bail!("max gas is lower than the minimum instance cost")
+            }
+            if Slot::new(validity_end.0, validity_end.1)
+                < Slot::new(validity_start.0, validity_start.1)
+            {
+                bail!("validity end is earlier than the validity start")
+            }
+            if Slot::new(validity_end.0, validity_end.1) < emission_slot {
+                bail!("validity end is earlier than the current slot")
+            }
         }
 
         let emission_index = execution_context.created_message_index;
@@ -1517,11 +1525,15 @@ impl Interface for InterfaceImpl {
 
     fn get_address_category_wasmv1(&self, to_check: &str) -> Result<AddressCategory> {
         let addr = Address::from_str(to_check)?;
-        match addr {
-            Address::User(_) => Ok(AddressCategory::UserAddress),
-            Address::SC(_) => Ok(AddressCategory::ScAddress),
+        let execution_component_version = context_guard!(self).execution_component_version;
+
+        match (addr, execution_component_version) {
+            (Address::User(_), 0) => Ok(AddressCategory::ScAddress),
+            (Address::SC(_), 0) => Ok(AddressCategory::UserAddress),
+            (Address::User(_), _) => Ok(AddressCategory::UserAddress),
+            (Address::SC(_), _) => Ok(AddressCategory::ScAddress),
             #[allow(unreachable_patterns)]
-            _ => Ok(AddressCategory::Unspecified),
+            (_, _) => Ok(AddressCategory::Unspecified),
         }
     }
 

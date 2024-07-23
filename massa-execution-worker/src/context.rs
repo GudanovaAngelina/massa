@@ -40,7 +40,7 @@ use massa_module_cache::controller::ModuleCache;
 use massa_pos_exports::PoSChanges;
 use massa_serialization::Serializer;
 use massa_versioning::address_factory::{AddressArgs, AddressFactory};
-use massa_versioning::versioning::MipStore;
+use massa_versioning::versioning::{MipComponent, MipStore};
 use massa_versioning::versioning_factory::{FactoryStrategy, VersioningFactory};
 use parking_lot::RwLock;
 use rand::SeedableRng;
@@ -179,6 +179,9 @@ pub struct ExecutionContext {
     /// The gas remaining before the last subexecution.
     /// so *excluding* the gas used by the last sc call.
     pub gas_remaining_before_subexecution: Option<u64>,
+
+    /// The version of the execution component
+    pub execution_component_version: u32,
 }
 
 impl ExecutionContext {
@@ -201,6 +204,15 @@ impl ExecutionContext {
         mip_store: MipStore,
         execution_trail_hash: massa_hash::Hash,
     ) -> Self {
+        let slot = Slot::new(0, 0);
+        let ts = get_block_slot_timestamp(
+            config.thread_count,
+            config.t0,
+            config.genesis_timestamp,
+            slot,
+        )
+        .unwrap();
+
         ExecutionContext {
             speculative_ledger: SpeculativeLedger::new(
                 final_state.clone(),
@@ -227,7 +239,7 @@ impl ExecutionContext {
                 active_history,
             ),
             creator_min_balance: Default::default(),
-            slot: Slot::new(0, 0),
+            slot,
             created_addr_index: Default::default(),
             created_event_index: Default::default(),
             created_message_index: Default::default(),
@@ -240,9 +252,13 @@ impl ExecutionContext {
             origin_operation_id: Default::default(),
             module_cache,
             config,
-            address_factory: AddressFactory { mip_store },
+            address_factory: AddressFactory {
+                mip_store: mip_store.clone(),
+            },
             execution_trail_hash,
             gas_remaining_before_subexecution: None,
+            execution_component_version: mip_store
+                .get_latest_component_version_at(&MipComponent::Execution, ts),
         }
     }
 
@@ -335,11 +351,21 @@ impl ExecutionContext {
         let execution_trail_hash =
             generate_execution_trail_hash(&prev_execution_trail_hash, &slot, None, true);
 
+        let ts = get_block_slot_timestamp(
+            config.thread_count,
+            config.t0,
+            config.genesis_timestamp,
+            slot,
+        )
+        .unwrap();
+
         // return readonly context
         ExecutionContext {
             slot,
             stack: call_stack,
             read_only: true,
+            execution_component_version: mip_store
+                .get_latest_component_version_at(&MipComponent::Execution, ts),
             ..ExecutionContext::new(
                 config,
                 final_state,
@@ -360,7 +386,19 @@ impl ExecutionContext {
     /// A vector of `(Option<Bytecode>, AsyncMessage)` pairs where:
     /// * `Option<Bytecode>` is the bytecode to execute (or `None` if not found)
     /// * `AsyncMessage` is the asynchronous message to execute
-    pub(crate) fn take_async_batch(
+    pub(crate) fn take_async_batch_v0(
+        &mut self,
+        max_gas: u64,
+        async_msg_cst_gas_cost: u64,
+    ) -> Vec<(Option<Bytecode>, AsyncMessage)> {
+        self.speculative_async_pool
+            .take_batch_to_execute(self.slot, max_gas, async_msg_cst_gas_cost)
+            .into_iter()
+            .map(|(_id, msg)| (self.get_bytecode(&msg.destination), msg))
+            .collect()
+    }
+
+    pub(crate) fn take_async_batch_v1(
         &mut self,
         max_gas: u64,
         async_msg_cst_gas_cost: u64,
@@ -405,10 +443,20 @@ impl ExecutionContext {
             false,
         );
 
+        let ts = get_block_slot_timestamp(
+            config.thread_count,
+            config.t0,
+            config.genesis_timestamp,
+            slot,
+        )
+        .unwrap();
+
         // return active slot execution context
         ExecutionContext {
             slot,
             opt_block_id,
+            execution_component_version: mip_store
+                .get_latest_component_version_at(&MipComponent::Execution, ts),
             ..ExecutionContext::new(
                 config,
                 final_state,
@@ -880,23 +928,91 @@ impl ExecutionContext {
         result
     }
 
-    /// Finishes a slot and generates the execution output.
-    /// Settles emitted asynchronous messages, reimburse the senders of deleted messages.
-    /// Moves the output of the execution out of the context,
-    /// resetting some context fields in the process.
-    ///
-    /// This is used to get the output of an execution before discarding the context.
-    /// Note that we are not taking self by value to consume it because the context is shared.
-    pub fn settle_slot(&mut self, block_info: Option<ExecutedBlockInfo>) -> ExecutionOutput {
+    fn settle_slot_v0(&mut self, block_info: Option<ExecutedBlockInfo>) -> ExecutionOutput {
+        let slot = self.slot;
+        // execute the deferred credits coming from roll sells
+        let deferred_credits_transfers = self.execute_deferred_credits(&slot);
+
+        // take the ledger changes first as they are needed for async messages and cache
+        let ledger_changes = self.speculative_ledger.take();
+
+        // settle emitted async messages and reimburse the senders of deleted messages
+        let deleted_messages =
+            self.speculative_async_pool
+                .settle_slot(&slot, &ledger_changes, false);
+
+        let mut cancel_async_message_transfers = vec![];
+        for (_msg_id, msg) in deleted_messages {
+            if let Some(t) = self.cancel_async_message(&msg) {
+                cancel_async_message_transfers.push(t)
+            }
+        }
+
+        // update module cache
+        let bc_updates = ledger_changes.get_bytecode_updates();
+
+        {
+            let mut cache_write_lock = self.module_cache.write();
+            for bytecode in bc_updates {
+                cache_write_lock.save_module(&bytecode.0);
+            }
+        }
+        // if the current slot is last in cycle check the production stats and act accordingly
+        let auto_sell_rolls = if self
+            .slot
+            .is_last_of_cycle(self.config.periods_per_cycle, self.config.thread_count)
+        {
+            self.speculative_roll_state.settle_production_stats(
+                &slot,
+                self.config.periods_per_cycle,
+                self.config.thread_count,
+                self.config.roll_price,
+                self.config.max_miss_ratio,
+            )
+        } else {
+            vec![]
+        };
+
+        // generate the execution output
+        let state_changes = StateChanges {
+            ledger_changes,
+            async_pool_changes: self.speculative_async_pool.take(),
+            pos_changes: self.speculative_roll_state.take(),
+            executed_ops_changes: self.speculative_executed_ops.take(),
+            executed_denunciations_changes: self.speculative_executed_denunciations.take(),
+            execution_trail_hash_change: SetOrKeep::Set(self.execution_trail_hash),
+        };
+        std::mem::take(&mut self.opt_block_id);
+        ExecutionOutput {
+            slot,
+            block_info,
+            state_changes,
+            events: std::mem::take(&mut self.events),
+            #[cfg(feature = "execution-trace")]
+            slot_trace: None,
+            #[cfg(feature = "dump-block")]
+            storage: None,
+            deferred_credits_execution: deferred_credits_transfers,
+            cancel_async_message_execution: cancel_async_message_transfers,
+            auto_sell_execution: auto_sell_rolls,
+        }
+    }
+
+    fn settle_slot_with_fixed_ledger_change_handling(
+        &mut self,
+        block_info: Option<ExecutedBlockInfo>,
+    ) -> ExecutionOutput {
         let slot = self.slot;
 
         // execute the deferred credits coming from roll sells
         let deferred_credits_transfers = self.execute_deferred_credits(&slot);
 
         // settle emitted async messages and reimburse the senders of deleted messages
-        let deleted_messages = self
-            .speculative_async_pool
-            .settle_slot(&slot, &self.speculative_ledger.added_changes);
+        let deleted_messages = self.speculative_async_pool.settle_slot(
+            &slot,
+            &self.speculative_ledger.added_changes,
+            true,
+        );
 
         let mut cancel_async_message_transfers = vec![];
         for (_msg_id, msg) in deleted_messages {
@@ -953,6 +1069,20 @@ impl ExecutionContext {
             deferred_credits_execution: deferred_credits_transfers,
             cancel_async_message_execution: cancel_async_message_transfers,
             auto_sell_execution: auto_sell_rolls,
+        }
+    }
+
+    /// Finishes a slot and generates the execution output.
+    /// Settles emitted asynchronous messages, reimburse the senders of deleted messages.
+    /// Moves the output of the execution out of the context,
+    /// resetting some context fields in the process.
+    ///
+    /// This is used to get the output of an execution before discarding the context.
+    /// Note that we are not taking self by value to consume it because the context is shared.
+    pub fn settle_slot(&mut self, block_info: Option<ExecutedBlockInfo>) -> ExecutionOutput {
+        match self.execution_component_version {
+            0 => self.settle_slot_v0(block_info),
+            _ => self.settle_slot_with_fixed_ledger_change_handling(block_info),
         }
     }
 
