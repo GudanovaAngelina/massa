@@ -15,6 +15,7 @@ use crate::stats::ExecutionStatsCounter;
 #[cfg(feature = "dump-block")]
 use crate::storage_backend::StorageBackend;
 use massa_async_pool::AsyncMessage;
+use massa_deferred_calls::DeferredCall;
 use massa_execution_exports::{
     EventStore, ExecutedBlockInfo, ExecutionBlockMetadata, ExecutionChannels, ExecutionConfig,
     ExecutionError, ExecutionOutput, ExecutionQueryCycleInfos, ExecutionQueryStakerInfo,
@@ -27,6 +28,7 @@ use massa_metrics::MassaMetrics;
 use massa_models::address::ExecutionAddressCycleInfo;
 use massa_models::bytecode::Bytecode;
 
+use massa_models::config::DEFERRED_CALL_MAX_FUTURE_SLOTS;
 use massa_models::datastore::get_prefix_bounds;
 use massa_models::denunciation::{Denunciation, DenunciationIndex};
 use massa_models::execution::EventFilter;
@@ -51,7 +53,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tracing::{debug, info, trace, warn};
 
-use crate::execution_info::{AsyncMessageExecutionResult, DenunciationResult};
+use crate::execution_info::{
+    AsyncMessageExecutionResult, DeferredCallExecutionResult, DenunciationResult,
+};
 #[cfg(feature = "execution-info")]
 use crate::execution_info::{ExecutionInfo, ExecutionInfoForSlot, OperationInfo};
 #[cfg(feature = "execution-trace")]
@@ -1221,6 +1225,118 @@ impl ExecutionState {
         }
     }
 
+    fn execute_deferred_call(
+        &self,
+        call: DeferredCall,
+    ) -> Result<DeferredCallExecutionResult, ExecutionError> {
+        let mut result = DeferredCallExecutionResult::new(&call);
+
+        let snapshot;
+        // prepare the current slot context for executing the operation
+        let bytecode;
+        {
+            let mut context = context_guard!(self);
+            snapshot = context.get_snapshot();
+            // acquire write access to the context
+            // let mut context = context_guard!(self);
+
+            // Set the call stack
+            // This needs to be defined before anything can fail, so that the emitted event contains the right stack
+            context.stack = vec![
+                ExecutionStackElement {
+                    address: call.sender_address,
+                    coins: call.coins,
+                    owned_addresses: vec![call.sender_address],
+                    operation_datastore: None,
+                },
+                ExecutionStackElement {
+                    address: call.target_address,
+                    coins: call.coins,
+                    owned_addresses: vec![call.target_address],
+                    operation_datastore: None,
+                },
+            ];
+
+            // Ensure that the target address is an SC address
+            // Ensure that the target address exists
+            context.check_target_sc_address(call.target_address)?;
+
+            // credit coins to the target address
+            if let Err(err) =
+                context.transfer_coins(None, Some(call.target_address), call.coins, false)
+            {
+                // coin crediting failed: reset context to snapshot and reimburse sender
+                let err = ExecutionError::RuntimeError(format!(
+                    "could not credit coins to target of deferred call execution: {}",
+                    err
+                ));
+
+                context.reset_to_snapshot(snapshot, err.clone());
+                context.deferred_call_fail_exec(&call);
+                return Err(err);
+            }
+
+            // quit if there is no function to be called
+            if call.target_function.is_empty() {
+                return Err(ExecutionError::RuntimeError(
+                    "no function to call in the deferred call".to_string(),
+                ));
+            }
+
+            // Load bytecode. Assume empty bytecode if not found.
+            bytecode = context
+                .get_bytecode(&call.target_address)
+                .unwrap_or_default()
+                .0;
+        }
+
+        let module = self
+            .module_cache
+            .write()
+            .load_module(&bytecode, call.max_gas)?;
+        let response = massa_sc_runtime::run_function(
+            &*self.execution_interface,
+            module,
+            &call.target_function,
+            &call.parameters,
+            call.max_gas,
+            self.config.gas_costs.clone(),
+        );
+
+        match response {
+            Ok(res) => {
+                self.module_cache
+                    .write()
+                    .set_init_cost(&bytecode, res.init_gas_cost);
+                #[cfg(feature = "execution-trace")]
+                {
+                    result.traces = Some((res.trace.into_iter().map(|t| t.into()).collect(), true));
+                }
+                // #[cfg(feature = "execution-info")]
+                // {
+                // result.success = true;
+                // }
+                result.success = true;
+                Ok(result)
+            }
+            Err(error) => {
+                if let VMError::ExecutionError { init_gas_cost, .. } = error {
+                    self.module_cache
+                        .write()
+                        .set_init_cost(&bytecode, init_gas_cost);
+                }
+                // execution failed: reset context to snapshot and reimburse sender
+                let err = ExecutionError::VMError {
+                    context: "Deferred Call".to_string(),
+                    error,
+                };
+                let mut context = context_guard!(self);
+                context.reset_to_snapshot(snapshot, err.clone());
+                context.deferred_call_fail_exec(&call);
+                Err(err)
+            }
+        }
+    }
     /// Executes a full slot (with or without a block inside) without causing any changes to the state,
     /// just yielding the execution output.
     ///
@@ -1242,6 +1358,7 @@ impl ExecutionState {
             slot: *slot,
             operation_call_stacks: PreHashMap::default(),
             asc_call_stacks: vec![],
+            deferred_call_stacks: vec![],
         };
         #[cfg(feature = "execution-trace")]
         let mut transfers = vec![];
@@ -1260,6 +1377,13 @@ impl ExecutionState {
             self.mip_store.clone(),
         );
 
+        // Deferred calls
+        let calls = execution_context.deferred_calls_advance_slot(
+            slot.clone(),
+            DEFERRED_CALL_MAX_FUTURE_SLOTS,
+            self.config.thread_count,
+        );
+
         // Get asynchronous messages to execute
         let messages = execution_context.take_async_batch(
             self.config.max_async_gas,
@@ -1269,9 +1393,53 @@ impl ExecutionState {
         // Apply the created execution context for slot execution
         *context_guard!(self) = execution_context;
 
+        for (id, call) in calls.slot_calls {
+            if call.cancelled {
+                // Skip cancelled calls
+                continue;
+            }
+            match self.execute_deferred_call(call) {
+                Ok(_exec) => {
+                    info!("executed deferred call: {:?}", id);
+                    cfg_if::cfg_if! {
+                        if #[cfg(feature = "execution-trace")] {
+                            // Safe to unwrap
+                            slot_trace.deferred_call_stacks.push(_exec.traces.unwrap().0);
+                        } else if #[cfg(feature = "execution-info")] {
+                            slot_trace.deferred_call_stacks.push(_exec.traces.clone().unwrap().0);
+                            exec_info.deferred_calls_messages.push(Ok(_exec));
+                        }
+                    }
+                }
+                Err(err) => {
+                    let msg = format!("failed executing deferred call: {}", err);
+                    #[cfg(feature = "execution-info")]
+                    exec_info.deferred_calls_messages.push(Err(msg.clone()));
+                    debug!(msg);
+                }
+            }
+        }
+
+        // execute async messages as long as there is remaining gas in the slot (counting both unused max_async_gas and max_block_gas, and the latter can be used in full in case of block miss)
+
+        let mut remaining_async_slot_gas = self.config.max_async_gas.saturating_sub(calls.slot_gas);
+        let mut remaining_block_gas = self.config.max_gas_per_block.saturating_sub(calls.slot_gas);
+
         // Try executing asynchronous messages.
         // Effects are cancelled on failure and the sender is reimbursed.
         for (opt_bytecode, message) in messages {
+            // TODO verify here
+            if remaining_async_slot_gas == 0 || remaining_block_gas == 0 {
+                // break if there is no gas left
+                break;
+            }
+            if message.max_gas > remaining_async_slot_gas || message.max_gas > remaining_block_gas {
+                // Skip message if there is not enough gas left for it
+                continue;
+            }
+
+            remaining_async_slot_gas = remaining_async_slot_gas.saturating_sub(message.max_gas);
+            remaining_block_gas = remaining_block_gas.saturating_sub(message.max_gas);
             match self.execute_async_message(message, opt_bytecode) {
                 Ok(_message_return) => {
                     cfg_if::cfg_if! {

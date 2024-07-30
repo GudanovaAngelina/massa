@@ -9,12 +9,15 @@
 
 use crate::active_history::HistorySearchResult;
 use crate::speculative_async_pool::SpeculativeAsyncPool;
+use crate::speculative_deferred_calls::SpeculativeDeferredCallRegistry;
 use crate::speculative_executed_denunciations::SpeculativeExecutedDenunciations;
 use crate::speculative_executed_ops::SpeculativeExecutedOps;
 use crate::speculative_ledger::SpeculativeLedger;
 use crate::{active_history::ActiveHistory, speculative_roll_state::SpeculativeRollState};
 use massa_async_pool::{AsyncMessage, AsyncPoolChanges};
 use massa_async_pool::{AsyncMessageId, AsyncMessageInfo};
+use massa_deferred_calls::registry_changes::DeferredRegistryChanges;
+use massa_deferred_calls::{DeferredCall, DeferredSlotCalls};
 use massa_executed_ops::{ExecutedDenunciationsChanges, ExecutedOpsChanges};
 use massa_execution_exports::{
     EventStore, ExecutedBlockInfo, ExecutionConfig, ExecutionError, ExecutionOutput,
@@ -26,6 +29,7 @@ use massa_ledger_exports::{LedgerChanges, SetOrKeep};
 use massa_models::address::ExecutionAddressCycleInfo;
 use massa_models::block_id::BlockIdSerializer;
 use massa_models::bytecode::Bytecode;
+use massa_models::deferred_call_id::DeferredCallId;
 use massa_models::denunciation::DenunciationIndex;
 use massa_models::timeslots::get_block_slot_timestamp;
 use massa_models::{
@@ -57,6 +61,9 @@ pub struct ExecutionContextSnapshot {
 
     /// speculative asynchronous pool messages emitted so far in the context
     pub async_pool_changes: AsyncPoolChanges,
+
+    /// speculative deferred calls changes
+    pub deferred_calls_changes: DeferredRegistryChanges,
 
     /// the associated message infos for the speculative async pool
     pub message_infos: BTreeMap<AsyncMessageId, AsyncMessageInfo>,
@@ -120,6 +127,9 @@ pub struct ExecutionContext {
     /// speculative asynchronous pool state,
     /// as seen after everything that happened so far in the context
     speculative_async_pool: SpeculativeAsyncPool,
+
+    /// speculative deferred calls state,
+    speculative_deferred_calls: SpeculativeDeferredCallRegistry,
 
     /// speculative roll state,
     /// as seen after everything that happened so far in the context
@@ -214,6 +224,10 @@ impl ExecutionContext {
                 final_state.clone(),
                 active_history.clone(),
             ),
+            speculative_deferred_calls: SpeculativeDeferredCallRegistry::new(
+                final_state.clone(),
+                active_history.clone(),
+            ),
             speculative_roll_state: SpeculativeRollState::new(
                 final_state.clone(),
                 active_history.clone(),
@@ -253,6 +267,7 @@ impl ExecutionContext {
         ExecutionContextSnapshot {
             ledger_changes: self.speculative_ledger.get_snapshot(),
             async_pool_changes,
+            deferred_calls_changes: self.speculative_deferred_calls.get_snapshot(),
             message_infos,
             pos_changes: self.speculative_roll_state.get_snapshot(),
             executed_ops: self.speculative_executed_ops.get_snapshot(),
@@ -280,6 +295,8 @@ impl ExecutionContext {
             .reset_to_snapshot(snapshot.ledger_changes);
         self.speculative_async_pool
             .reset_to_snapshot((snapshot.async_pool_changes, snapshot.message_infos));
+        self.speculative_deferred_calls
+            .reset_to_snapshot(snapshot.deferred_calls_changes);
         self.speculative_roll_state
             .reset_to_snapshot(snapshot.pos_changes);
         self.speculative_executed_ops
@@ -937,6 +954,7 @@ impl ExecutionContext {
         let state_changes = StateChanges {
             ledger_changes,
             async_pool_changes: self.speculative_async_pool.take(),
+            deferred_call_changes: self.speculative_deferred_calls.take(),
             pos_changes: self.speculative_roll_state.take(),
             executed_ops_changes: self.speculative_executed_ops.take(),
             executed_denunciations_changes: self.speculative_executed_denunciations.take(),
@@ -1114,6 +1132,127 @@ impl ExecutionContext {
                 "The called address {} is not a smart contract address",
                 target_sc_address
             ))),
+        }
+    }
+
+    pub fn deferred_calls_get_slot_booked_gas(&self, slot: &Slot) -> u64 {
+        self.speculative_deferred_calls.get_slot_gas(slot)
+    }
+
+    pub fn deferred_calls_advance_slot(
+        &mut self,
+        current_slot: Slot,
+        async_call_max_booking_slots: u64,
+        thread_count: u8,
+    ) -> DeferredSlotCalls {
+        self.speculative_deferred_calls.advance_slot(
+            current_slot,
+            async_call_max_booking_slots,
+            thread_count,
+        )
+    }
+
+    /// Get the price it would cost to reserve "gas" at target slot "slot".
+    pub fn deferred_calls_compute_call_fee(
+        &self,
+        target_slot: Slot,
+        max_gas: u64,
+        thread_count: u8,
+        async_call_max_booking_slots: u64,
+        max_async_gas: u64,
+        async_gas_target: u64,
+        global_overbooking_penalty: Amount,
+        slot_overbooking_penalty: Amount,
+        current_slot: Slot,
+    ) -> Result<Amount, ExecutionError> {
+        self.speculative_deferred_calls.compute_call_fee(
+            target_slot,
+            max_gas,
+            thread_count,
+            async_call_max_booking_slots,
+            max_async_gas,
+            async_gas_target,
+            global_overbooking_penalty,
+            slot_overbooking_penalty,
+            current_slot,
+        )
+    }
+
+    pub fn deferred_call_register(
+        &mut self,
+        call: DeferredCall,
+    ) -> Result<DeferredCallId, ExecutionError> {
+        self.speculative_deferred_calls
+            .register_call(call, self.execution_trail_hash)
+    }
+
+    pub fn deferred_call_exist(&self, call_id: &DeferredCallId) -> bool {
+        self.speculative_deferred_calls.get_call(call_id).is_some()
+    }
+
+    /// when a deferred call execution fail we need to refund the coins to the caller
+    pub fn deferred_call_fail_exec(
+        &mut self,
+        call: &DeferredCall,
+    ) -> Option<(Address, Result<Amount, String>)> {
+        #[allow(unused_assignments, unused_mut)]
+        let mut result = None;
+
+        let transfer_result =
+            self.transfer_coins(None, Some(call.sender_address), call.coins, false);
+        if let Err(e) = transfer_result.as_ref() {
+            debug!(
+                "deferred call cancel: reimbursement of {} failed: {}",
+                call.sender_address, e
+            );
+        }
+
+        #[cfg(feature = "execution-info")]
+        if let Err(e) = transfer_result {
+            result = Some((call.sender_address, Err(e.to_string())))
+        } else {
+            result = Some((call.sender_address, Ok(call.coins)));
+        }
+
+        result
+    }
+
+    pub fn deferred_call_delete(&mut self, call_id: &DeferredCallId, slot: Slot) {
+        self.speculative_deferred_calls.delete_call(call_id, slot);
+    }
+
+    pub fn deferred_call_cancel(
+        &mut self,
+        call_id: &DeferredCallId,
+        caller_address: Address,
+    ) -> Result<(), ExecutionError> {
+        match self.speculative_deferred_calls.get_call(call_id) {
+            Some(call) => {
+                // check that the caller is the one who registered the deferred call
+                if call.sender_address != caller_address {
+                    return Err(ExecutionError::DeferredCallsError(format!(
+                        "only the caller {} can cancel the deferred call",
+                        call.sender_address
+                    )));
+                }
+
+                let (address, amount) = self.speculative_deferred_calls.cancel_call(call_id)?;
+
+                // refund the coins to the caller
+                let transfer_result = self.transfer_coins(None, Some(address), amount, false);
+                if let Err(e) = transfer_result.as_ref() {
+                    debug!(
+                        "deferred call cancel: reimbursement of {} failed: {}",
+                        address, e
+                    );
+                }
+
+                Ok(())
+            }
+            _ => Err(ExecutionError::DeferredCallsError(format!(
+                "deferred call {} does not exist",
+                call_id
+            )))?,
         }
     }
 }
